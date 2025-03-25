@@ -187,6 +187,7 @@ def sysObj():
                     "packets_sent": network.packets_sent,
                     "packets_received": network.packets_recv,
                 },
+                "battery": psutil.sensors_battery(),
                 "timestamp": time.time(),
             },
         }, 200
@@ -284,17 +285,13 @@ def system_info():
                 "cpu_threads": psutil.cpu_count(logical=True),
                 "memory_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
             },
-            "network": {
-                "hostname": platform.node(),
-                "ip_addresses": [
-                    addr.address
-                    for iface in psutil.net_if_addrs().values()
-                    for addr in iface
-                    if addr.family == 2
-                ][
-                    :2
-                ],
-            },
+            "hostname": platform.node(),
+            "ip_addresses": [
+                addr.address
+                for iface in psutil.net_if_addrs().values()
+                for addr in iface
+                if addr.family == 2
+            ][:2],
             "environment": {
                 "user": os.getenv("USER") or os.getenv("USERNAME"),
                 "home": os.path.expanduser("~"),
