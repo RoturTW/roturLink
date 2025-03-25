@@ -279,13 +279,11 @@ def system_info():
                 "release": platform.release(),
                 "version": platform.version(),
                 "machine": platform.machine(),
-                "architecture": platform.machine(),
             },
             "memory": {
                 "total": memory.total,
                 "total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
             },
-            "hostname": platform.node(),
             "ip_addresses": [
                 addr.address
                 for iface in psutil.net_if_addrs().values()
