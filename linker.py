@@ -163,13 +163,9 @@ def sysObj():
             "status": "success",
             "data": {
                 "cpu": {
-                    "count": psutil.cpu_count(),
-                    "physical_count": psutil.cpu_count(logical=False),
                     "percent": system_metrics_cache["cpu_percent"],
-                    "brand": platform.processor(),
                 },
                 "memory": {
-                    "total": memory.total,
                     "available": memory.available,
                     "percent": memory.percent,
                     "used": memory.used,
@@ -262,10 +258,16 @@ def proxy():
 def system_info():
     if not isAllowed(request):
         return {"status": "error", "message": "Unauthorized request"}, 403
-
+    
+    memory = psutil.virtual_memory()
     try:
         # System and platform info
         system_info = {
+            "cpu": {
+                "count": psutil.cpu_count(),
+                "physical_count": psutil.cpu_count(logical=False),
+                "brand": platform.processor(),
+            },
             "python": {
                 "version": platform.python_version(),
                 "implementation": platform.python_implementation(),
@@ -279,11 +281,9 @@ def system_info():
                 "machine": platform.machine(),
                 "architecture": platform.machine(),
             },
-            "hardware": {
-                "processor": platform.processor(),
-                "cpu_cores": psutil.cpu_count(logical=False),
-                "cpu_threads": psutil.cpu_count(logical=True),
-                "memory_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+            "memory": {
+                "total": memory.total,
+                "total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
             },
             "hostname": platform.node(),
             "ip_addresses": [
