@@ -21,95 +21,6 @@ bluetooth = ensure_module_installed("bleak")
 volume = ensure_module_installed("pyvolume", "volume-control")
 from flask import Flask, request, jsonify, Response
 
-BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
-BATTERY_CHARACTERISTIC_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
-
-battery_cache = {}
-BATTERY_CACHE_TTL = 300
-
-async def get_battery_level(address):
-    try:
-        from bleak import BleakClient
-        client = BleakClient(address)
-        await client.connect(timeout=5.0)
-        
-        services = await client.get_services()
-        for service in services:
-            if service.uuid.lower() == BATTERY_SERVICE_UUID:
-                for char in service.characteristics:
-                    if char.uuid.lower() == BATTERY_CHARACTERISTIC_UUID:
-                        battery_bytes = await client.read_gatt_char(char.uuid)
-                        battery_level = int(battery_bytes[0])
-                        await client.disconnect()
-                        return battery_level
-                        
-        await client.disconnect()
-    except Exception as e:
-        pass
-    
-    return None
-
-def get_battery_from_system(address, device_name=None):
-    system = platform.system()
-    battery_level = None
-    
-    if system == "Darwin":
-        try:
-            if device_name and any(keyword in device_name.lower() for keyword in 
-                                 ["airpods", "beats", "keyboard", "mouse", "trackpad"]):
-                cmd = ["system_profiler", "SPBluetoothDataType", "-json"]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                
-                import json
-                data = json.loads(result.stdout)
-                
-                if "SPBluetoothDataType" in data:
-                    for device in data["SPBluetoothDataType"]:
-                        if "device_connected" in device:
-                            for connected in device["device_connected"]:
-                                if address.lower() in connected.get("device_address", "").lower() or \
-                                   (device_name and device_name.lower() in connected.get("device_name", "").lower()):
-                                    if "device_batteryLevelMain" in connected:
-                                        return int(connected["device_batteryLevelMain"])
-        except Exception:
-            pass
-            
-    elif system == "Windows":
-        try:
-            if device_name:
-                cmd = ["powershell", "-Command", 
-                      f"Get-PnpDevice | Where-Object {{ $_.FriendlyName -like '*{device_name}*' }} | Get-PnpDeviceProperty -KeyName DEVPKEY_DeviceBatteryLevel"]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                
-                match = re.search(r"(\d+)%", result.stdout)
-                if match:
-                    return int(match.group(1))
-        except Exception:
-            pass
-            
-    return battery_level
-
-async def get_device_battery(address, device_name=None):
-    current_time = time.time()
-    
-    if address in battery_cache:
-        cache_entry = battery_cache[address]
-        if current_time - cache_entry["timestamp"] < BATTERY_CACHE_TTL:
-            return cache_entry["level"]
-    
-    battery_level = await get_battery_level(address)
-    
-    if battery_level is None:
-        battery_level = get_battery_from_system(address, device_name)
-    
-    if battery_level is not None:
-        battery_cache[address] = {
-            "level": battery_level,
-            "timestamp": current_time
-        }
-    
-    return battery_level
-
 app = Flask(__name__)
 sys.modules["flask.cli"].show_server_banner = lambda *x: None
 
@@ -267,18 +178,10 @@ async def scan_bluetooth_devices():
             if device_info["rssi"] is None and hasattr(device, '_rssi'):
                 device_info["rssi"] = getattr(device, '_rssi', None)
             
-            try:
-                battery_level = await get_device_battery(device.address, device.name)
-                device_info["battery"] = battery_level
-            except Exception as e:
-                if "--debug" in sys.argv: print(f"[roturLink] Battery detection error: {str(e)}")
-                device_info["battery"] = None
-            
             BLUETOOTH_DEVICES[device.address] = {
                 "name": device_info["name"],
                 "address": device.address,
                 "rssi": device_info["rssi"],
-                "battery": device_info.get("battery"),
                 "last_seen": current_time
             }
             active_addresses.add(device.address)
@@ -291,7 +194,6 @@ async def scan_bluetooth_devices():
                 "name": device_data["name"],
                 "address": device_data["address"],
                 "rssi": device_data["rssi"],
-                "battery": device_data.get("battery"),
                 "last_seen": device_data["last_seen"]
             })
         
@@ -305,7 +207,7 @@ async def scan_bluetooth_devices():
         return devices
     except Exception as e:
         if "--debug" in sys.argv: print(f"[roturLink] Bluetooth scan error: {str(e)}")
-        return [{"name": data["name"], "address": data["address"], "rssi": -90, "battery": data.get("battery")} 
+        return [{"name": data["name"], "address": data["address"], "rssi": -90} 
                 for data in BLUETOOTH_DEVICES.values()]
 
 async def send_to_client(ws, message):
@@ -380,14 +282,12 @@ async def broadcast_bluetooth_task():
                             "count": len(devices), 
                             "active_count": sum(1 for device in devices if device.get("rssi", -90) > -90),
                             "timestamp": time.time(),
-                            "battery_info_count": sum(1 for device in devices if device.get("battery") is not None)
                         }
                     }
                 })
                 if "--debug" in sys.argv and len(devices) > 0:
                     active_count = sum(1 for device in devices if device.get("rssi", -90) > -90)
-                    battery_count = sum(1 for device in devices if device.get("battery") is not None)
-                    print(f"[roturLink] Broadcasting {len(devices)} BT devices ({active_count} active, {battery_count} with battery) to {len(connected_clients)} clients")
+                    print(f"[roturLink] Broadcasting {len(devices)} BT devices ({active_count} active, to {len(connected_clients)} clients")
             except Exception as e:
                 if "--debug" in sys.argv: print(f"[roturLink] Bluetooth broadcast error: {str(e)}")
         await asyncio.sleep(BLUETOOTH_BROADCAST_INTERVAL)
