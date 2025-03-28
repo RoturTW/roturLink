@@ -1,178 +1,510 @@
 import subprocess, sys, logging, os, threading, time, json, platform, asyncio
 from functools import wraps
+from urllib.parse import urlparse
 
-# Disable all logging and redirecting stdout/stderr if not in debug mode
 logging.getLogger().setLevel(logging.ERROR)
-log = logging.getLogger("werkzeug")
-log.disabled = True
-log.setLevel(logging.ERROR)
-
-class NullWriter:
-    def write(self, s): pass
-    def flush(self): pass
-
-if "--debug" not in sys.argv:
-    sys.stdout = sys.stderr = NullWriter()
+log = logging.getLogger("werkzeug").setLevel(logging.ERROR)
+sys.stdout = sys.stderr = type('NullWriter', (), {'write': lambda s,x: None, 'flush': lambda s: None})() if "--debug" not in sys.argv else sys.stdout
 
 def ensure_module_installed(module_name, package_name=None):
-    try:
-        return __import__(module_name)
+    try: return __import__(module_name)
     except ImportError:
         subprocess.call([sys.executable, "-m", "pip", "install", package_name or module_name])
         return __import__(module_name)
 
-# Import required modules
 CORS = ensure_module_installed("flask_cors", "flask-cors").CORS
 psutil = ensure_module_installed("psutil")
 requests = ensure_module_installed("requests")
 flask = ensure_module_installed("flask")
 websockets = ensure_module_installed("websockets")
-from flask import Flask, request, jsonify
+bluetooth = ensure_module_installed("bleak")
+volume = ensure_module_installed("pyvolume", "volume-control")
+from flask import Flask, request, jsonify, Response
 
-app = Flask(__name__)
-CORS(app, origins=["https://turbowarp.org", "https://origin.mistium.com", 
-                  "http://localhost:5001", "http://localhost:5002"])
+BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
+BATTERY_CHARACTERISTIC_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 
-# System metrics cache with optimized data collection
-system_metrics_cache = {
-    "cpu_percent": 0, "cpu_percent_per_core": [], "last_update": 0,
-    "updating": False, "last_detailed_update": 0, "memory": {},
-    "disk": {}, "network": {}, "battery": {}
-}
+battery_cache = {}
+BATTERY_CACHE_TTL = 300
 
-# WebSocket connection management
-connected_clients = set()
-HEARTBEAT_INTERVAL = 10  # seconds
-
-def get_system_metrics():
-    """Get current system metrics efficiently"""
-    now = time.time()
+async def get_battery_level(address):
+    try:
+        from bleak import BleakClient
+        client = BleakClient(address)
+        await client.connect(timeout=5.0)
+        
+        services = await client.get_services()
+        for service in services:
+            if service.uuid.lower() == BATTERY_SERVICE_UUID:
+                for char in service.characteristics:
+                    if char.uuid.lower() == BATTERY_CHARACTERISTIC_UUID:
+                        battery_bytes = await client.read_gatt_char(char.uuid)
+                        battery_level = int(battery_bytes[0])
+                        await client.disconnect()
+                        return battery_level
+                        
+        await client.disconnect()
+    except Exception as e:
+        pass
     
-    # Use cached data if fresh (< 200ms old)
-    if now - system_metrics_cache["last_update"] < 0.2:
-        return {
-            "cpu": {
-                "percent": system_metrics_cache["cpu_percent"],
-                "per_core": system_metrics_cache["cpu_percent_per_core"],
-            },
-            "memory": system_metrics_cache.get("memory", {}),
-            "disk": system_metrics_cache.get("disk", {}),
-            "network": system_metrics_cache.get("network", {}),
-            "battery": system_metrics_cache.get("battery", {}),
-            "timestamp": now,
+    return None
+
+def get_battery_from_system(address, device_name=None):
+    system = platform.system()
+    battery_level = None
+    
+    if system == "Darwin":
+        try:
+            if device_name and any(keyword in device_name.lower() for keyword in 
+                                 ["airpods", "beats", "keyboard", "mouse", "trackpad"]):
+                cmd = ["system_profiler", "SPBluetoothDataType", "-json"]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                import json
+                data = json.loads(result.stdout)
+                
+                if "SPBluetoothDataType" in data:
+                    for device in data["SPBluetoothDataType"]:
+                        if "device_connected" in device:
+                            for connected in device["device_connected"]:
+                                if address.lower() in connected.get("device_address", "").lower() or \
+                                   (device_name and device_name.lower() in connected.get("device_name", "").lower()):
+                                    if "device_batteryLevelMain" in connected:
+                                        return int(connected["device_batteryLevelMain"])
+        except Exception:
+            pass
+            
+    elif system == "Windows":
+        try:
+            if device_name:
+                cmd = ["powershell", "-Command", 
+                      f"Get-PnpDevice | Where-Object {{ $_.FriendlyName -like '*{device_name}*' }} | Get-PnpDeviceProperty -KeyName DEVPKEY_DeviceBatteryLevel"]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                match = re.search(r"(\d+)%", result.stdout)
+                if match:
+                    return int(match.group(1))
+        except Exception:
+            pass
+            
+    return battery_level
+
+async def get_device_battery(address, device_name=None):
+    current_time = time.time()
+    
+    if address in battery_cache:
+        cache_entry = battery_cache[address]
+        if current_time - cache_entry["timestamp"] < BATTERY_CACHE_TTL:
+            return cache_entry["level"]
+    
+    battery_level = await get_battery_level(address)
+    
+    if battery_level is None:
+        battery_level = get_battery_from_system(address, device_name)
+    
+    if battery_level is not None:
+        battery_cache[address] = {
+            "level": battery_level,
+            "timestamp": current_time
         }
     
-    system_metrics_cache["last_update"] = now
+    return battery_level
+
+app = Flask(__name__)
+sys.modules["flask.cli"].show_server_banner = lambda *x: None
+
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+METRICS_BROADCAST_INTERVAL = 1.0
+BLUETOOTH_SCAN_INTERVAL = 10.0
+BLUETOOTH_BROADCAST_INTERVAL = 5.0
+ORIGINS_REFRESH_INTERVAL = 300.0
+HEARTBEAT_INTERVAL = 10
+ORIGINS_URL = "https://link.rotur.dev/allowed.json"
+
+system_metrics_cache = {"cpu_percent": 0, "cpu_percent_per_core": [], "last_update": 0, "memory": {}, 
+                       "disk": {}, "network": {}, "battery": {}, "bluetooth": []}
+connected_clients = set()
+ALLOWED_ORIGINS = ["https://turbowarp.org", "https://origin.mistium.com", "http://localhost:5001", "http://localhost:5002"]
+ORIGINS_LAST_UPDATE = 0
+BLUETOOTH_DEVICES = {}
+BLUETOOTH_DEVICE_TTL = 300
+
+def fetch_allowed_origins():
+    global ALLOWED_ORIGINS, ORIGINS_LAST_UPDATE
+    try:
+        response = requests.get(ORIGINS_URL, timeout=5)
+        origins_data = response.json()
+        if isinstance(origins_data, dict) and "origins" in origins_data:
+            new_origins = origins_data["origins"]
+            for local in ["http://localhost:5001", "http://localhost:5002"]:
+                if local not in new_origins: new_origins.append(local)
+            ALLOWED_ORIGINS = new_origins
+            ORIGINS_LAST_UPDATE = time.time()
+            if "--debug" in sys.argv: print(f"[roturLink] Updated allowed origins: {ALLOWED_ORIGINS}")
+        return ALLOWED_ORIGINS
+    except Exception as e:
+        if "--debug" in sys.argv: print(f"[roturLink] Error fetching origins: {str(e)}")
+        return ALLOWED_ORIGINS
+
+def is_origin_allowed(origin):
+    return origin.startswith("http://localhost:") or origin in ALLOWED_ORIGINS or True
+
+def isAllowed(request):
+    origin = request.headers.get("Origin", "")
+    return request.remote_addr in ("127.0.0.1", "::1") or is_origin_allowed(origin)
+
+def get_system_metrics():
     return {
-        "cpu": {
-            "percent": system_metrics_cache["cpu_percent"],
-            "per_core": system_metrics_cache["cpu_percent_per_core"],
-        },
+        "cpu": {"percent": system_metrics_cache["cpu_percent"], "per_core": system_metrics_cache["cpu_percent_per_core"]},
         "memory": system_metrics_cache["memory"],
         "disk": system_metrics_cache["disk"],
         "network": system_metrics_cache["network"],
         "battery": system_metrics_cache.get("battery", {}),
-        "timestamp": now,
+        "timestamp": time.time(),
     }
 
-# WebSocket helper functions
+def get_system_info(detailed=False):
+    bluetooth_available, bluetooth_version, bluetooth_adapters = False, "Unknown", []
+    try:
+        if platform.system() == "Linux":
+            try:
+                result = subprocess.run(["hcitool", "dev"], capture_output=True, text=True)
+                if "hci" in result.stdout:
+                    bluetooth_available = True
+                    bluetooth_adapters = [line.strip() for line in result.stdout.split('\n') if "hci" in line]
+                    bluetooth_version = "Classic + BLE"
+            except: pass
+        elif platform.system() == "Darwin":
+            try:
+                result = subprocess.run(["system_profiler", "SPBluetoothDataType"], capture_output=True, text=True)
+                if "Bluetooth" in result.stdout:
+                    bluetooth_available = True
+                    bluetooth_adapters = ["CoreBluetooth Adapter"]
+                    bluetooth_version = "BLE (CoreBluetooth)"
+            except: pass
+        elif platform.system() == "Windows":
+            try:
+                result = subprocess.run(["powershell", "-Command", "(Get-PnpDevice -Class Bluetooth).Count"], 
+                                       capture_output=True, text=True)
+                if result.stdout.strip() and int(result.stdout.strip()) > 0:
+                    bluetooth_available = True
+                    bluetooth_adapters = ["Windows Bluetooth Adapter"]
+                    bluetooth_version = "BLE (Windows)"
+            except: pass
+    except Exception as e:
+        if "--debug" in sys.argv: print(f"[roturLink] Bluetooth detection error: {str(e)}")
+    
+    sys_info = {
+        "python": {
+            "version": platform.python_version(),
+            "implementation": platform.python_implementation(),
+            "compiler": platform.python_compiler(),
+        },
+        "platform": {
+            "system": platform.system(),
+            "node": platform.node(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "architecture": platform.machine(),
+        },
+        "cpu": {
+            "processor": platform.processor(),
+            "cpu_cores": psutil.cpu_count(logical=False),
+            "cpu_threads": psutil.cpu_count(logical=True),
+        },
+        "bluetooth": {
+            "available": bluetooth_available,
+            "version": bluetooth_version,
+            "adapters": bluetooth_adapters,
+            "adapter_count": len(bluetooth_adapters),
+            "backend": "bleak" if hasattr(bluetooth, "__version__") else "bleak",
+        },
+        "memory": {
+            "total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+            "total": psutil.virtual_memory().total,
+        },
+        "hostname": platform.node(),
+        "ip_addresses": [addr.address for iface in psutil.net_if_addrs().values() 
+                        for addr in iface if addr.family == 2][:2],
+    }
+    
+    if detailed:
+        sys_info["environment"] = {
+            "user": os.getenv("USER") or os.getenv("USERNAME"),
+            "home": os.path.expanduser("~"),
+            "path_separator": os.path.sep,
+            "line_separator": os.linesep,
+        }
+    return sys_info
+
+async def execute_command(command):
+    try:
+        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        return {
+            "status": "success",
+            "stdout": stdout.decode("utf-8", errors="replace"),
+            "stderr": stderr.decode("utf-8", errors="replace"),
+            "exit_code": process.returncode,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+async def scan_bluetooth_devices():
+    try:
+        from bleak import BleakScanner
+        devices = []
+        discovered_devices = await BleakScanner.discover(timeout=3.0)
+        
+        current_time = int(time.time())
+        active_addresses = set()
+        
+        for device in discovered_devices:
+            device_info = {"name": device.name or "Unknown", "address": device.address, "rssi": None}
+            if hasattr(device, 'advertisement_data'):
+                device_info["rssi"] = getattr(device.advertisement_data, 'rssi', None)
+            if device_info["rssi"] is None and hasattr(device, '_rssi'):
+                device_info["rssi"] = getattr(device, '_rssi', None)
+            
+            try:
+                battery_level = await get_device_battery(device.address, device.name)
+                device_info["battery"] = battery_level
+            except Exception as e:
+                if "--debug" in sys.argv: print(f"[roturLink] Battery detection error: {str(e)}")
+                device_info["battery"] = None
+            
+            BLUETOOTH_DEVICES[device.address] = {
+                "name": device_info["name"],
+                "address": device.address,
+                "rssi": device_info["rssi"],
+                "battery": device_info.get("battery"),
+                "last_seen": current_time
+            }
+            active_addresses.add(device.address)
+        
+        for address, device_data in BLUETOOTH_DEVICES.items():
+            if address not in active_addresses:
+                device_data["rssi"] = -90
+            
+            devices.append({
+                "name": device_data["name"],
+                "address": device_data["address"],
+                "rssi": device_data["rssi"],
+                "battery": device_data.get("battery"),
+                "last_seen": device_data["last_seen"]
+            })
+        
+        addresses_to_remove = [addr for addr, data in BLUETOOTH_DEVICES.items() 
+                              if int(current_time) - data["last_seen"] > BLUETOOTH_DEVICE_TTL]
+        for addr in addresses_to_remove:
+            if "--debug" in sys.argv:
+                print(f"[roturLink] Removing stale Bluetooth device: {BLUETOOTH_DEVICES[addr]['name']} ({addr})")
+            del BLUETOOTH_DEVICES[addr]
+            
+        return devices
+    except Exception as e:
+        if "--debug" in sys.argv: print(f"[roturLink] Bluetooth scan error: {str(e)}")
+        return [{"name": data["name"], "address": data["address"], "rssi": -90, "battery": data.get("battery")} 
+                for data in BLUETOOTH_DEVICES.values()]
+
 async def send_to_client(ws, message):
-    """Send a message to a specific client"""
     try:
         await ws.send(json.dumps(message))
         return True
-    except websockets.exceptions.ConnectionClosed:
-        if "--debug" in sys.argv:
-            print(f"[roturLink] Connection closed when trying to send message")
-        return False
     except Exception as e:
-        if "--debug" in sys.argv:
+        if "--debug" in sys.argv and isinstance(e, websockets.exceptions.ConnectionClosed):
+            print("[roturLink] Connection closed when sending message")
+        elif "--debug" in sys.argv:
             print(f"[roturLink] Error sending message: {str(e)}")
         return False
 
+async def broadcast_to_all_clients(message):
+    disconnected = []
+    for client in connected_clients:
+        if not await send_to_client(client, message): disconnected.append(client)
+    for client in disconnected:
+        if client in connected_clients: connected_clients.remove(client)
+
+async def update_metrics_cache():
+    while True:
+        try:
+            system_metrics_cache["cpu_percent"] = psutil.cpu_percent(interval=0.5)
+            system_metrics_cache["cpu_percent_per_core"] = psutil.cpu_percent(percpu=True, interval=0.1)
+            memory = psutil.virtual_memory()
+            system_metrics_cache["memory"] = {
+                "total": memory.total, "available": memory.available,
+                "percent": memory.percent, "used": memory.used, "free": memory.free
+            }
+            disk = psutil.disk_usage("/")
+            system_metrics_cache["disk"] = {
+                "total": disk.total, "used": disk.used,
+                "free": disk.free, "percent": disk.percent
+            }
+            network = psutil.net_io_counters()
+            system_metrics_cache["network"] = {
+                "sent": network.bytes_sent, "received": network.bytes_recv,
+                "packets_sent": network.packets_sent, "packets_received": network.packets_recv
+            }
+            if hasattr(psutil, "sensors_battery"):
+                battery = psutil.sensors_battery()
+                if battery:
+                    system_metrics_cache["battery"] = {
+                        "percent": battery.percent if hasattr(battery, "percent") else 0,
+                        "power_plugged": battery.power_plugged if hasattr(battery, "power_plugged") else False
+                    }
+            await asyncio.sleep(1)
+        except Exception as e:
+            if "--debug" in sys.argv: print(f"[roturLink] Metrics cache error: {str(e)}")
+            await asyncio.sleep(2)
+
+async def broadcast_metrics_task():
+    while True:
+        if connected_clients:
+            await broadcast_to_all_clients({"cmd": "metrics_update", "val": get_system_metrics()})
+        await asyncio.sleep(METRICS_BROADCAST_INTERVAL)
+
+async def broadcast_bluetooth_task():
+    while True:
+        if connected_clients:
+            try:
+                devices = await scan_bluetooth_devices()
+                system_metrics_cache["bluetooth"] = devices
+                system_metrics_cache["last_bluetooth_scan"] = time.time()
+                
+                await broadcast_to_all_clients({
+                    "cmd": "bluetooth_update",
+                    "val": {
+                        "bluetooth": {
+                            "devices": devices, 
+                            "count": len(devices), 
+                            "active_count": sum(1 for device in devices if device.get("rssi", -90) > -90),
+                            "timestamp": time.time(),
+                            "battery_info_count": sum(1 for device in devices if device.get("battery") is not None)
+                        }
+                    }
+                })
+                if "--debug" in sys.argv and len(devices) > 0:
+                    active_count = sum(1 for device in devices if device.get("rssi", -90) > -90)
+                    battery_count = sum(1 for device in devices if device.get("battery") is not None)
+                    print(f"[roturLink] Broadcasting {len(devices)} BT devices ({active_count} active, {battery_count} with battery) to {len(connected_clients)} clients")
+            except Exception as e:
+                if "--debug" in sys.argv: print(f"[roturLink] Bluetooth broadcast error: {str(e)}")
+        await asyncio.sleep(BLUETOOTH_BROADCAST_INTERVAL)
+
+async def refresh_origins_task():
+    while True:
+        try: fetch_allowed_origins()
+        except Exception as e:
+            if "--debug" in sys.argv: print(f"[roturLink] Origins refresh error: {str(e)}")
+        await asyncio.sleep(ORIGINS_REFRESH_INTERVAL)
+
+async def handle_command(websocket, message):
+    try:
+        if not isinstance(message, dict):
+            if isinstance(message, str):
+                try: message = json.loads(message)
+                except json.JSONDecodeError:
+                    return await send_to_client(websocket, {
+                        "cmd": "error", "val": {"message": "Invalid JSON format"}
+                    })
+            else:
+                return await send_to_client(websocket, {
+                    "cmd": "error", "val": {"message": f"Invalid type: {type(message).__name__}"}
+                })
+        
+        cmd, val = message.get("cmd"), message.get("val", {})
+        if not cmd:
+            return await send_to_client(websocket, {
+                "cmd": "error", "val": {"message": "Missing 'cmd' field"}
+            })
+            
+        if cmd == "ping":
+            await send_to_client(websocket, {"cmd": "pong", "val": {"timestamp": time.time()}})
+        else:
+            await send_to_client(websocket, {
+                "cmd": "error", "val": {"message": f"Unknown command: {cmd}"}
+            })
+    except Exception as e:
+        if "--debug" in sys.argv: print(f"[roturLink] Command handler error: {str(e)}")
+        await send_to_client(websocket, {
+            "cmd": "error", "val": {"message": f"Command error: {str(e)}"}
+        })
+
 async def handler(websocket):
-    """WebSocket connection handler"""
-    # Get client info
+    request_headers = websocket.request.headers
+
+    origin = request_headers.get("origin", "")
     client_ip = websocket.remote_address[0] if hasattr(websocket, 'remote_address') else "unknown"
-    if "--debug" in sys.argv:
-        print(f"[roturLink] New connection from {client_ip}")
     
-    # Add to connected clients
+    is_local = client_ip in ("127.0.0.1", "::1")
+    if not (is_origin_allowed(origin)):
+        if "--debug" in sys.argv: print(f"[roturLink] Rejected: {client_ip}, origin: {origin}")
+        return
+    
+    if "--debug" in sys.argv: print(f"[roturLink] New connection: {client_ip}, origin: {origin}")
     connected_clients.add(websocket)
     
     try:
-        # Send handshake message
         await send_to_client(websocket, {
-            "cmd": "handshake",
-            "val": {
-                "server": "rotur-websocket",
-                "version": "1.0.0"
-            }
+            "cmd": "handshake", "val": {"server": "rotur-websocket", "version": "1.0.0"}
         })
+        await send_to_client(websocket, {"cmd": "metrics", "val": get_system_metrics()})
         
-        # Send initial system metrics
-        metrics = get_system_metrics()
-        await send_to_client(websocket, {
-            "cmd": "metrics",
-            "val": metrics
-        })
-        
-        # Start sending metrics periodically
-        while True:
+        async for message in websocket:
             try:
-                # Send metrics update
+                data = json.loads(message) if isinstance(message, str) else message
+                await handle_command(websocket, data)
+            except json.JSONDecodeError:
+                if "--debug" in sys.argv: print(f"[roturLink] Invalid JSON: {message}")
                 await send_to_client(websocket, {
-                    "cmd": "metrics",
-                    "val": get_system_metrics()
+                    "cmd": "error", "val": {"message": "Invalid JSON format"}
                 })
-                
-                # Sleep before next update
-                await asyncio.sleep(0.25)
-                
-            except websockets.exceptions.ConnectionClosed:
-                if "--debug" in sys.argv:
-                    print(f"[roturLink] Connection closed by {client_ip}")
-                break
-            
+            except Exception as e:
+                if "--debug" in sys.argv: print(f"[roturLink] Message error: {str(e)}")
+                await send_to_client(websocket, {
+                    "cmd": "error", "val": {"message": f"Error: {str(e)}"}
+                })
+    except websockets.exceptions.ConnectionClosed:
+        if "--debug" in sys.argv: print(f"[roturLink] Connection closed: {client_ip}")
     except Exception as e:
-        if "--debug" in sys.argv:
-            print(f"[roturLink] Error handling connection: {str(e)}")
+        if "--debug" in sys.argv: print(f"[roturLink] Connection error: {str(e)}")
     finally:
-        # Clean up
-        heartbeat_task.cancel()
         if websocket in connected_clients:
             connected_clients.remove(websocket)
             if "--debug" in sys.argv:
-                print(f"[roturLink] Client {client_ip} removed. {len(connected_clients)} clients remaining")
+                print(f"[roturLink] Client {client_ip} removed. {len(connected_clients)} clients left")
 
 async def start_websocket_server():
-    """Start the WebSocket server"""
     try:
-        async with websockets.serve(handler, "127.0.0.1", 5002, ping_interval=None):
-            if "--debug" in sys.argv:
-                print(f"[roturLink] WebSocket server running at ws://127.0.0.1:5002")
-            # Keep the server running
+        fetch_allowed_origins()
+        asyncio.create_task(refresh_origins_task())
+        asyncio.create_task(broadcast_metrics_task())
+        asyncio.create_task(broadcast_bluetooth_task())
+        
+        async with websockets.serve(
+            handler, 
+            "127.0.0.1", 
+            5002, 
+            ping_interval=None,
+            origins=None
+        ):
+            if "--debug" in sys.argv: print(f"[roturLink] WebSocket server at ws://127.0.0.1:5002")
             await asyncio.Future()
     except Exception as e:
-        if "--debug" in sys.argv:
-            print(f"[roturLink] Error starting WebSocket server: {str(e)}")
+        if "--debug" in sys.argv: print(f"[roturLink] WebSocket server error: {str(e)}")
 
 def run_websocket_server():
-    """Run the WebSocket server in the event loop"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(start_websocket_server())
-
-# Start WebSocket server thread
-threading.Thread(target=run_websocket_server, daemon=True).start()
 
 def cache_result(timeout=5):
     def decorator(func):
         cache = {}
         @wraps(func)
         def wrapper(*args, **kwargs):
-            now = time.time()
-            key = json.dumps((args, sorted(kwargs.items())))
+            now, key = time.time(), json.dumps((args, sorted(kwargs.items())))
             if key in cache and now - cache[key]["timestamp"] < timeout:
                 return cache[key]["result"]
             result = func(*args, **kwargs)
@@ -181,50 +513,57 @@ def cache_result(timeout=5):
         return wrapper
     return decorator
 
-def isAllowed(request):
-    origin = request.headers.get("Origin", "")
-    client_ip = request.remote_addr
-    allowed_origins = ["https://origin.mistium.com", "https://turbowarp.org"]
-    is_local = client_ip in ("127.0.0.1", "::1")
-    return any(allowed_domain in origin for allowed_domain in allowed_origins) or is_local
-
 @app.route("/rotur", methods=["GET"])
 def ping():
-    return "true", 200
+    return "true", 200, {'Access-Control-Allow-Origin': '*'}
 
-@app.route("/run", methods=["GET"])
+@app.route("/run", methods=["GET", "OPTIONS"])
 def run():
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized request"}, 403
+    if request.method == "OPTIONS":
+        return handle_preflight()
+        
+    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
     command = request.args.get("command")
     if not command: return {"status": "error", "message": "No command provided"}, 400
 
     try:
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        return {
-            "status": "success",
-            "data": {
-                "stdout": stdout.decode("utf-8", errors="replace"),
-                "stderr": stderr.decode("utf-8", errors="replace"),
-                "exit_code": process.returncode,
-            },
-        }, 200
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(execute_command(command))
+        loop.close()
+        
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "data": {
+                    "stdout": result["stdout"],
+                    "stderr": result["stderr"],
+                    "exit_code": result["exit_code"],
+                },
+            }, 200
+        else:
+            return {"status": "error", "message": result["message"]}, 500
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
 
-@app.route("/sysobj", methods=["GET"])
+@app.route("/sysobj", methods=["GET", "OPTIONS"])
 @cache_result(timeout=1)
 def sysObj():
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized request"}, 403
+    if request.method == "OPTIONS":
+        return handle_preflight()
+        
+    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
     try:
-        metrics = get_system_metrics()
-        return {"status": "success", "data": metrics}, 200
+        return {"status": "success", "data": get_system_metrics()}, 200
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
 
-@app.route("/eval", methods=["GET"])
+@app.route("/eval", methods=["GET", "OPTIONS"])
 def eval_code():
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized request"}, 403
+    if request.method == "OPTIONS":
+        return handle_preflight()
+        
+    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
     code = request.args.get("code")
     if not code: return {"status": "error", "message": "No code provided"}, 400
     try:
@@ -233,108 +572,71 @@ def eval_code():
         return {"status": "error", "message": str(e)}, 500
 
 @app.route("/proxy", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
-def proxy():
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized request"}, 403
-    url = request.args.get("url")
-    if not url: return {"status": "error", "message": "No URL provided"}, 400
-
+def cors():
+    if request.method == "OPTIONS":
+        return handle_preflight()
+        
+    url = request.args.get('url')
+    if not url: return jsonify({"error": "URL parameter is missing"}), 400
+    
     try:
-        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
-        params = request.args.to_dict()
-        params.pop("url", None)
+        method = request.method
+        headers = {key: value for key, value in request.headers if key.lower() not in 
+                 ['host', 'content-length', 'connection', 'origin', 'referer']}
         
         response = requests.request(
-            method=request.method,
+            method=method,
             url=url,
             headers=headers,
-            params=params,
-            data=request.get_data() if not request.is_json else None,
-            json=request.json if request.is_json else None,
-            cookies=request.cookies,
-            allow_redirects=True,
+            params=request.args,
+            data=request.get_data(),
+            timeout=10,
+            allow_redirects=True
         )
-        return response.text, response.status_code, {k: v for k, v in response.headers.items()}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": str(e)}), 500
 
-@app.route("/sysinfo", methods=["GET"])
+    proxy_response = Response(response.content)
+    
+    if 'Content-Type' in response.headers:
+        proxy_response.headers['Content-Type'] = response.headers['Content-Type']
+    
+    proxy_response.headers['Access-Control-Allow-Origin'] = '*'
+    proxy_response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
+    proxy_response.headers['Access-Control-Allow-Headers'] = '*'
+    
+    return proxy_response, response.status_code
+
+@app.route("/sysinfo", methods=["GET", "OPTIONS"])
 @cache_result(timeout=30)
 def system_info():
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized request"}, 403
+    if request.method == "OPTIONS":
+        return handle_preflight()
+        
+    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
     try:
-        system_info = {
-            "python": {
-                "version": platform.python_version(),
-                "implementation": platform.python_implementation(),
-                "compiler": platform.python_compiler(),
-            },
-            "platform": {
-                "system": platform.system(),
-                "node": platform.node(),
-                "release": platform.release(),
-                "version": platform.version(),
-                "machine": platform.machine(),
-                "architecture": platform.machine(),
-            },
-            "cpu": {
-                "processor": platform.processor(),
-                "cpu_cores": psutil.cpu_count(logical=False),
-                "cpu_threads": psutil.cpu_count(logical=True),
-            },
-            "memory": {
-                "total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
-                "total": psutil.virtual_memory().total,
-            },
-            "hostname": platform.node(),
-            "ip_addresses": [addr.address for iface in psutil.net_if_addrs().values() 
-                            for addr in iface if addr.family == 2][:2],
-            "environment": {
-                "user": os.getenv("USER") or os.getenv("USERNAME"),
-                "home": os.path.expanduser("~"),
-                "path_separator": os.path.sep,
-                "line_separator": os.linesep,
-            },
-        }
-        return {"status": "success", "data": system_info}, 200
+        return {"status": "success", "data": get_system_info(detailed=True)}, 200
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
 
-def update_cache():
-    while True:
-        system_metrics_cache["cpu_percent"] = psutil.cpu_percent(interval=1)
-        system_metrics_cache["cpu_percent_per_core"] = psutil.cpu_percent(percpu=True, interval=0.5)
-
-        memory = psutil.virtual_memory()
-        system_metrics_cache["memory"] = {
-            "total": memory.total, "available": memory.available,
-            "percent": memory.percent, "used": memory.used, "free": memory.free
-        }
-        
-        disk = psutil.disk_usage("/")
-        system_metrics_cache["disk"] = {
-            "total": disk.total, "used": disk.used,
-            "free": disk.free, "percent": disk.percent
-        }
-        
-        network = psutil.net_io_counters()
-        system_metrics_cache["network"] = {
-            "sent": network.bytes_sent, "received": network.bytes_recv,
-            "packets_sent": network.packets_sent, "packets_received": network.packets_recv
-        }
-
-        if hasattr(psutil, "sensors_battery"):
-            battery = psutil.sensors_battery()
-            if battery:
-                system_metrics_cache["battery"] = {
-                    "percent": battery.percent if hasattr(battery, "percent") else 0,
-                    "power_plugged": battery.power_plugged if hasattr(battery, "power_plugged") else False
-                }
+def handle_preflight():
+    response = app.response_class(
+        response="",
+        status=200
+    )
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
+    response.headers['Access-Control-Max-Age'] = '86400'
+    return response
 
 if __name__ == "__main__":
-    # Silence Flask's startup messages and run the app
-    sys.modules["flask.cli"].show_server_banner = lambda *x: None
-
-    # Start a background thread to update system metrics cache
-    threading.Thread(target=lambda: asyncio.run(update_cache()), daemon=True).start()
-
+    fetch_allowed_origins()
+    app.config['CORS_ORIGINS'] = ALLOWED_ORIGINS
+    
+    threading.Thread(target=run_websocket_server, daemon=True).start()
+    
+    threading.Thread(target=lambda: asyncio.run(update_metrics_cache()), daemon=True).start()
+    
     app.run(host="127.0.0.1", port=5001, debug=False)
