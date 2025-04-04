@@ -177,7 +177,7 @@ async def scan_bluetooth_devices():
                 device_info["rssi"] = getattr(device.advertisement_data, 'rssi', None)
             if device_info["rssi"] is None and hasattr(device, '_rssi'):
                 device_info["rssi"] = getattr(device, '_rssi', None)
-
+            
             BLUETOOTH_DEVICES[device.address] = {
                 "name": device_info["name"],
                 "address": device.address,
