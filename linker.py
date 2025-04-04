@@ -26,6 +26,8 @@ sys.modules["flask.cli"].show_server_banner = lambda *x: None
 
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+AUTH = ""
+
 METRICS_BROADCAST_INTERVAL = 1.0
 BLUETOOTH_SCAN_INTERVAL = 10.0
 BLUETOOTH_BROADCAST_INTERVAL = 5.0
@@ -417,60 +419,6 @@ def cache_result(timeout=5):
 def ping():
     return "true", 200, {'Access-Control-Allow-Origin': '*'}
 
-@app.route("/run", methods=["GET", "OPTIONS"])
-def run():
-    if request.method == "OPTIONS":
-        return handle_preflight()
-        
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
-    command = request.args.get("command")
-    if not command: return {"status": "error", "message": "No command provided"}, 400
-
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(execute_command(command))
-        loop.close()
-        
-        if result["status"] == "success":
-            return {
-                "status": "success",
-                "data": {
-                    "stdout": result["stdout"],
-                    "stderr": result["stderr"],
-                    "exit_code": result["exit_code"],
-                },
-            }, 200
-        else:
-            return {"status": "error", "message": result["message"]}, 500
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
-
-@app.route("/sysobj", methods=["GET", "OPTIONS"])
-@cache_result(timeout=1)
-def sysObj():
-    if request.method == "OPTIONS":
-        return handle_preflight()
-        
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
-    try:
-        return {"status": "success", "data": get_system_metrics()}, 200
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
-
-@app.route("/eval", methods=["GET", "OPTIONS"])
-def eval_code():
-    if request.method == "OPTIONS":
-        return handle_preflight()
-        
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
-    code = request.args.get("code")
-    if not code: return {"status": "error", "message": "No code provided"}, 400
-    try:
-        return {"status": "success", "return": eval(code)}, 200
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
-
 @app.route("/proxy", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 def cors():
     if request.method == "OPTIONS":
@@ -507,18 +455,6 @@ def cors():
     proxy_response.headers['Access-Control-Allow-Headers'] = '*'
     
     return proxy_response, response.status_code
-
-@app.route("/sysinfo", methods=["GET", "OPTIONS"])
-@cache_result(timeout=30)
-def system_info():
-    if request.method == "OPTIONS":
-        return handle_preflight()
-        
-    if not isAllowed(request): return {"status": "error", "message": "Unauthorized"}, 403
-    try:
-        return {"status": "success", "data": get_system_info(detailed=True)}, 200
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
 
 def handle_preflight():
     response = app.response_class(
