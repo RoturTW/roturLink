@@ -2,6 +2,30 @@ import subprocess, sys, logging, os, threading, time, json, platform, asyncio, c
 from functools import wraps
 from urllib.parse import urlparse
 
+# Configuration from link.conf
+CONFIG = {
+    "allowed_modules": [
+        "system",
+        "cpu", 
+        "memory",
+        "disk",
+        "network",
+        "bluetooth",
+        "battery",
+        "temperature"
+    ],
+    "allowed_origins": [
+        "https://turbowarp.org",
+        "https://origin.mistium.com", 
+        "http://localhost:5001",
+        "http://localhost:5002",
+        "http://localhost:3000",
+        "http://127.0.0.1:5001",
+        "http://127.0.0.1:5002",
+        "http://127.0.0.1:3000"
+    ]
+}
+
 if platform.system() != "Linux":
     print("[roturLink] This script is made for Arch Linux. Running on non-Linux systems may not work as expected.")
     sys.exit(1)
@@ -63,7 +87,7 @@ ORIGINS_URL = "https://link.rotur.dev/allowed.json"
 
 system_metrics_cache = {"cpu_percent": 0, "memory": {}, "disk": {}, "network": {}, "battery": {}, "bluetooth": [], "wifi": {}, "brightness": 0, "volume": 0, "drives": [], "last_update": 0, "last_usb_scan": 0, "last_drive_check": 0}
 connected_clients = set()
-ALLOWED_ORIGINS = ["https://warp.mistium.com", "https://origin.mistium.com", "http://localhost:5001", "http://localhost:5002"]
+ALLOWED_ORIGINS = CONFIG["allowed_origins"].copy()
 BLUETOOTH_DEVICES = {}
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -73,7 +97,7 @@ def fetch_allowed_origins():
         response = requests.get(ORIGINS_URL, timeout=5)
         origins_data = response.json()
         if isinstance(origins_data, dict) and "origins" in origins_data:
-            ALLOWED_ORIGINS = origins_data["origins"] + ["http://localhost:5001", "http://localhost:5002"]
+            ALLOWED_ORIGINS = origins_data["origins"] + CONFIG["allowed_origins"]
     except Exception as e:
         if "--debug" in sys.argv: print(f"[roturLink] Origins fetch error: {e}")
 
