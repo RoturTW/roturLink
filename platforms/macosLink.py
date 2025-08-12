@@ -490,139 +490,117 @@ def get_usb_drives(force_scan=False):
     try:
         usb_drives = []
         volumes_path = "/Volumes"
-        
+
         if not os.path.exists(volumes_path):
             return []
-        
-        # List all mounted volumes in /Volumes
-        for volume_name in os.listdir(volumes_path):
-            if volume_name.startswith('.'):  # Skip hidden files
-                continue
-                
+
+        # Use `ls /Volumes` as requested to enumerate mounted volumes
+        ls_result = run_command(["ls", "-1", volumes_path])
+        if not ls_result.get("success"):
+            # Fallback to Python listing
+            volume_names = [name for name in os.listdir(volumes_path) if not name.startswith('.')]
+        else:
+            volume_names = [name for name in ls_result["stdout"].splitlines() if name and not name.startswith('.')]
+
+        # System/internal volumes we don't expose
+        blocked_volumes = {"Macintosh HD", "System", "Data", "Preboot", "Recovery", "VM"}
+
+        for volume_name in volume_names:
             volume_path = os.path.join(volumes_path, volume_name)
             if not os.path.isdir(volume_path):
                 continue
-            
-            # Skip the main system volume (Macintosh HD, etc.)
-            if volume_name in ["Macintosh HD", "System", "Data", "Preboot", "Recovery", "VM"]:
+            if volume_name in blocked_volumes:
                 continue
-            
+
             try:
-                # Get volume info using diskutil
-                result = run_command(["diskutil", "info", volume_path])
                 device_node = ""
-                size_gb = 0
+                size_gb = 0.0
                 filesystem = "unknown"
-                
-                if result["success"]:
-                    lines = result["stdout"].split("\n")
-                    for line in lines:
-                        line = line.strip()
-                        if "Device Node:" in line:
-                            device_node = line.split("Device Node:")[-1].strip()
-                        elif ("Disk Size:" in line or "Total Size:" in line or "Volume Total Space:" in line) and "GB" in line:
-                            # Parse size - examples:
-                            # "Disk Size: 122.7 GB (122714849280 Bytes) (exactly 239677440 512-Byte-Units)"
-                            # "Volume Total Space: 122.7 GB (122709737472 Bytes) (exactly 239667456 512-Byte-Units)"
+
+                # Prefer fast: get device and size via df
+                df_result = run_command(["df", "-k", volume_path])
+                if df_result.get("success"):
+                    lines = df_result["stdout"].splitlines()
+                    if len(lines) >= 2:
+                        parts = lines[1].split()
+                        # Expected: Filesystem, 1024-blocks, Used, Available, Capacity, iused, ifree, %iused, Mounted on
+                        if len(parts) >= 6:
+                            device_node = parts[0]
                             try:
-                                # Method 1: Extract bytes value from parentheses
-                                if "(" in line and "Bytes)" in line:
-                                    # Find the first parentheses containing bytes
-                                    start_paren = line.find("(")
-                                    end_paren = line.find("Bytes)", start_paren)
-                                    if start_paren != -1 and end_paren != -1:
-                                        bytes_part = line[start_paren + 1:end_paren].strip()
-                                        # Remove any commas and convert to int
-                                        bytes_value = int(bytes_part.replace(",", ""))
-                                        size_gb = round(bytes_value / (1024**3), 2)
-                                
-                                # Method 2: Extract GB value directly if bytes parsing failed
-                                if size_gb == 0 and "GB" in line:
-                                    # Look for pattern like "122.7 GB"
-                                    parts = line.split()
-                                    for i, part in enumerate(parts):
-                                        if part == "GB" and i > 0:
-                                            try:
-                                                gb_value = float(parts[i-1])
-                                                size_gb = round(gb_value, 2)
-                                                break
-                                            except (ValueError, IndexError):
-                                                pass
-                                
-                            except (ValueError, IndexError) as e:
-                                if "--debug" in sys.argv:
-                                    print(f"[roturLink] Size parsing error for {volume_name}: {e}")
-                                    print(f"[roturLink] Problem line: {line}")
-                        elif "File System Personality:" in line:
-                            filesystem = line.split("File System Personality:")[-1].strip()
-                        elif "Type (Bundle):" in line:
-                            # Alternative filesystem info
-                            fs_type = line.split("Type (Bundle):")[-1].strip()
-                            if filesystem == "unknown":
-                                filesystem = fs_type
-                
-                # Fallback: try to get size using df command
-                if size_gb == 0:
+                                blocks_1k = int(parts[1])
+                                size_gb = round((blocks_1k * 1024) / (1024**3), 2)
+                            except ValueError:
+                                pass
+
+                # Filesystem type via diskutil (fast enough per volume)
+                if PLIST_AVAILABLE:
+                    du_result = run_command(["diskutil", "info", "-plist", volume_path])
+                    if du_result.get("success") and du_result.get("stdout"):
+                        try:
+                            plist_data = plistlib.loads(du_result["stdout"].encode("utf-8"))
+                            filesystem = plist_data.get("FilesystemType") or plist_data.get("FilesystemName", filesystem)
+                            if not device_node:
+                                device_node = plist_data.get("DeviceNode", device_node)
+                            if not size_gb:
+                                # Try TotalSize or VolumeTotalSpace (bytes)
+                                total_bytes = plist_data.get("TotalSize") or plist_data.get("VolumeTotalSpace")
+                                if isinstance(total_bytes, int) and total_bytes > 0:
+                                    size_gb = round(total_bytes / (1024**3), 2)
+                        except Exception:
+                            pass
+                else:
+                    # Human-readable fallback parsing
+                    du_result = run_command(["diskutil", "info", volume_path])
+                    if du_result.get("success"):
+                        for line in du_result["stdout"].splitlines():
+                            line = line.strip()
+                            if not device_node and line.startswith("Device Node:"):
+                                device_node = line.split(":", 1)[1].strip()
+                            if line.startswith("File System Personality:"):
+                                filesystem = line.split(":", 1)[1].strip() or filesystem
+
+                # As a last resort, statvfs for size
+                if not size_gb:
                     try:
-                        df_result = run_command(["df", "-H", volume_path])
-                        if df_result["success"]:
-                            lines = df_result["stdout"].split("\n")
-                            if len(lines) > 1:
-                                parts = lines[1].split()
-                                if len(parts) >= 2:
-                                    # df -H gives human readable format like "32G"
-                                    size_str = parts[1]
-                                    if size_str.endswith('G'):
-                                        size_gb = round(float(size_str[:-1]), 2)
-                                    elif size_str.endswith('T'):
-                                        size_gb = round(float(size_str[:-1]) * 1024, 2)
-                                    elif size_str.endswith('M'):
-                                        size_gb = round(float(size_str[:-1]) / 1024, 2)
-                    except Exception as e:
-                        if "--debug" in sys.argv:
-                            print(f"[roturLink] df fallback error for {volume_name}: {e}")
-                
-                # Final fallback: try stat
-                if size_gb == 0:
-                    try:
-                        stat_result = os.statvfs(volume_path)
-                        total_bytes = stat_result.f_frsize * stat_result.f_blocks
+                        st = os.statvfs(volume_path)
+                        total_bytes = st.f_frsize * st.f_blocks
                         size_gb = round(total_bytes / (1024**3), 2)
-                    except Exception as e:
-                        if "--debug" in sys.argv:
-                            print(f"[roturLink] statvfs fallback error for {volume_name}: {e}")
-                
+                    except Exception:
+                        pass
+
+                device_node = device_node or f"/dev/disk_for_{volume_name}"
+
                 device_info = {
-                    "device_node": device_node or f"/dev/disk_for_{volume_name}",
+                    "device_node": device_node,
                     "name": volume_name,
                     "size_gb": size_gb,
                     "files": [],
                     "mount_points": [{
-                        "device": device_node or f"/dev/disk_for_{volume_name}",
+                        "device": device_node,
                         "mount_point": volume_path,
                         "mount_name": volume_name,
                         "filesystem": filesystem
                     }]
                 }
-                
-                # Get files if not too many drives
+
+                # Populate top-level files for a few drives only
                 if len(usb_drives) < 3:
                     try:
                         device_info["files"] = list_directory_contents(volume_path)
                     except Exception:
                         device_info["files"] = []
-                
+
                 usb_drives.append(device_info)
-                
+
             except Exception as e:
-                if "--debug" in sys.argv: 
+                if "--debug" in sys.argv:
                     print(f"[roturLink] Error processing volume {volume_name}: {e}")
                 continue
-        
+
         system_metrics_cache["drives"] = usb_drives
         system_metrics_cache["last_usb_scan"] = current_time
         return usb_drives
-        
+
     except Exception as e:
         if "--debug" in sys.argv: print(f"[roturLink] USB drives error: {e}")
         return system_metrics_cache.get("drives", [])
@@ -932,6 +910,7 @@ def get_drive_identifiers(drives):
 
 async def monitor_usb_drives():
     previous_drives = set()
+    initial_sent = False
     
     while True:
         try:
@@ -944,6 +923,15 @@ async def monitor_usb_drives():
             current_drives = await asyncio.to_thread(get_usb_drives, True)
             current_identifiers = get_drive_identifiers(current_drives)
             
+            # Send initial list once when clients are connected
+            if not initial_sent and connected_clients:
+                try:
+                    message = {"cmd": "drives_update", "val": {"drives": current_drives, "change_type": "initial"}}
+                    asyncio.create_task(broadcast_to_all_clients(message))
+                    initial_sent = True
+                except Exception:
+                    pass
+
             # Only notify on actual changes
             if previous_drives and current_identifiers != previous_drives:
                 removed_drives = previous_drives - current_identifiers
@@ -968,6 +956,18 @@ async def monitor_usb_drives():
         
         # Much longer sleep
         await asyncio.sleep(15.0)
+
+async def update_and_broadcast_drives():
+    """Periodically broadcast current drives to keep UIs in sync."""
+    while True:
+        try:
+            if connected_clients:
+                drives = await asyncio.to_thread(get_usb_drives)
+                message = {"cmd": "drives_update", "val": {"drives": drives, "change_type": "periodic"}}
+                asyncio.create_task(broadcast_to_all_clients(message))
+        except Exception as e:
+            if "--debug" in sys.argv: print(f"[roturLink] update_and_broadcast_drives error: {e}")
+        await asyncio.sleep(30.0)
 
 async def handle_command(websocket, message):
     try:
@@ -1026,6 +1026,12 @@ async def handler(websocket):
         await send_to_client(websocket, {"cmd": "handshake", "val": {"server": "rotur-websocket", "version": "1.0.0"}})
         await send_to_client(websocket, {"cmd": "system_info", "val": get_system_info()})
         await send_to_client(websocket, {"cmd": "metrics", "val": get_system_metrics()})
+        # Push current drives immediately on connect
+        try:
+            drives_now = await asyncio.to_thread(get_usb_drives)
+            await send_to_client(websocket, {"cmd": "drives_update", "val": {"drives": drives_now, "change_type": "initial"}})
+        except Exception:
+            pass
         
         async for message in websocket:
             asyncio.create_task(handle_command(websocket, message))
@@ -1040,7 +1046,8 @@ async def start_websocket_server():
     # Temporarily disable expensive functions to isolate CPU issue
     # asyncio.create_task(update_and_broadcast_bluetooth())
     # asyncio.create_task(update_and_broadcast_wifi())
-    # asyncio.create_task(monitor_usb_drives())
+    asyncio.create_task(monitor_usb_drives())
+    asyncio.create_task(update_and_broadcast_drives())
     
     async with websockets.serve(handler, "127.0.0.1", 5002, ping_interval=None):
         if "--debug" in sys.argv: print("[roturLink] WebSocket server at ws://127.0.0.1:5002")
@@ -1099,21 +1106,11 @@ def proxy():
 
 # Consolidated endpoints with path validation
 def validate_usb_path(path):
-    # On macOS, allow access to any volume in /Volumes (except system volumes)
+    # Match Linux approach: only allow paths under known mounted drive mount_points
+    usb_drives = get_usb_drives()
+    allowed_paths = [mp["mount_point"] for drive in usb_drives for mp in drive.get("mount_points", [])]
     full_path = f"/{path}" if not path.startswith('/') else path
-    
-    # Allow access to /Volumes and its subdirectories
-    if full_path.startswith('/Volumes/'):
-        # Extract volume name
-        path_parts = full_path.split('/')
-        if len(path_parts) >= 3:
-            volume_name = path_parts[2]
-            # Block access to system volumes for security
-            blocked_volumes = ["Macintosh HD", "System", "Data", "Preboot", "Recovery", "VM"]
-            if volume_name not in blocked_volumes:
-                return True, full_path
-    
-    return False, full_path
+    return any(full_path.startswith(ap) for ap in allowed_paths), full_path
 
 # USB and file system endpoints
 @create_endpoint("/usb/drives")
