@@ -644,7 +644,7 @@ async def scan_bluetooth_devices():
         if "--debug" in sys.argv: print(f"[roturLink] Bluetooth error: {e}")
         return list(BLUETOOTH_DEVICES.values())
 
-def list_directory_contents(path, max_files=50):
+def list_directory_contents(path):
     try:
         if not os.path.exists(path) or not os.path.isdir(path):
             return []
@@ -652,7 +652,7 @@ def list_directory_contents(path, max_files=50):
         items = []
         entries = sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
         
-        for entry in entries[:max_files]:
+        for entry in entries:
             try:
                 full_path = os.path.join(path, entry)
                 if not os.path.exists(full_path):
