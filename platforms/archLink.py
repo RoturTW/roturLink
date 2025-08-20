@@ -43,30 +43,45 @@ def ensure_module_installed(module_name, arch_package=None):
                 return __import__(module_name)
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
+        return None
 
 # Install dependencies
-CORS = ensure_module_installed("flask_cors", "python-flask-cors").CORS
+flask_cors_module = ensure_module_installed("flask_cors", "python-flask-cors")
+CORS = flask_cors_module.CORS if flask_cors_module else None
 psutil = ensure_module_installed("psutil", "python-psutil")
 requests = ensure_module_installed("requests", "python-requests")
 flask = ensure_module_installed("flask", "python-flask")
 websockets = ensure_module_installed("websockets", "python-websockets")
 bluetooth = ensure_module_installed("bleak", "python-bleak")
-pyudev = ensure_module_installed("pyudev", "python-pyudev")
+pyudev_module = ensure_module_installed("pyudev", "python-pyudev")
 
 # Add helper function for parent device traversal
-from pyudev import Context
-
-context = Context()
+if pyudev_module:
+    from pyudev import Context
+    context = Context()
+else:
+    context = None
 
 def get_parent_device(device):
     try:
-        parent = device.parent
-        return parent
+        if pyudev_module and device:
+            parent = device.parent
+            return parent
     except Exception:
-        return None
+        pass
+    return None
 
 # Optional modules
-PULSEAUDIO_AVAILABLE = bool(ensure_module_installed("pulsectl", "python-pulsectl"))
+try:
+    pulsectl_module = ensure_module_installed("pulsectl", "python-pulsectl")
+    if pulsectl_module:
+        # Test if pulsectl can actually be imported and used
+        import pulsectl
+        PULSEAUDIO_AVAILABLE = True
+    else:
+        PULSEAUDIO_AVAILABLE = False
+except Exception:
+    PULSEAUDIO_AVAILABLE = False
 try:
     import gi
     gi.require_version('NM', '1.0')
@@ -79,7 +94,8 @@ from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 sys.modules["flask.cli"].show_server_banner = lambda *x: None
-CORS(app, resources={r"/*": {"origins": "*"}})
+if CORS:
+    CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Configuration
 METRICS_INTERVAL, BLUETOOTH_INTERVAL, USB_SCAN_INTERVAL, USB_MONITOR_INTERVAL, HEARTBEAT_INTERVAL = 1.0, 5.0, 10.0, 2.0, 10
@@ -135,7 +151,8 @@ def get_system_metrics():
     }
 
 def get_system_info():
-    bluetooth_available = "Controller" in run_command(["bluetoothctl", "show"]).get("stdout", "")
+    bluetooth_result = run_command(["bluetoothctl", "show"])
+    bluetooth_available = bluetooth_result.get("success", False) and "Controller" in bluetooth_result.get("stdout", "")
     return {
         "platform": {"system": "Arch Linux", "architecture": platform.machine()},
         "cpu": {"cores": psutil.cpu_count(logical=False), "threads": psutil.cpu_count(logical=True)},
@@ -340,7 +357,8 @@ def mount_usb_drive(device_path):
 
 def get_unmounted_usb_devices():
     try:
-        context = pyudev.Context()
+        if not context:
+            return []
         unmounted_devices = []
         
         # Get mounted devices
@@ -432,7 +450,10 @@ def get_usb_drives(force_scan=False):
     auto_mount_usb_drives()
     
     try:
-        context = pyudev.Context()
+        if not context:
+            system_metrics_cache["drives"] = []
+            system_metrics_cache["last_usb_scan"] = current_time
+            return []
         usb_drives = []
         
         for device in context.list_devices(subsystem='block', DEVTYPE='disk'):
@@ -533,7 +554,14 @@ async def scan_bluetooth_devices():
             
         return devices
     except Exception as e:
-        if "--debug" in sys.argv: print(f"[roturLink] Bluetooth error: {e}")
+        error_msg = str(e)
+        if "--debug" in sys.argv: 
+            if "org.bluez" in error_msg or "NameHasNoOwner" in error_msg:
+                print(f"[roturLink] Bluetooth error: Bluetooth service (bluez) not available or not running. Error: {e}")
+            elif "Permission" in error_msg:
+                print(f"[roturLink] Bluetooth error: Permission denied. Try running with appropriate permissions. Error: {e}")
+            else:
+                print(f"[roturLink] Bluetooth error: {e}")
         return list(BLUETOOTH_DEVICES.values())
 
 def list_directory_contents(path):
