@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 CONFIG = {
     "allowed_modules": [
         "system",
-        "cpu", 
+        "cpu",
         "memory",
         "disk",
         "network",
@@ -16,7 +16,7 @@ CONFIG = {
     ],
     "allowed_origins": [
         "https://turbowarp.org",
-        "https://origin.mistium.com", 
+        "https://origin.mistium.com",
         "http://localhost:5001",
         "http://localhost:5002",
         "http://localhost:3000",
@@ -34,7 +34,7 @@ logging.getLogger().setLevel(logging.ERROR)
 sys.stdout = sys.stderr = type('NullWriter', (), {'write': lambda s,x: None, 'flush': lambda s: None})() if "--debug" not in sys.argv else sys.stdout
 
 def ensure_module_installed(module_name, arch_package=None):
-    try: 
+    try:
         return __import__(module_name)
     except ImportError:
         if arch_package:
@@ -43,30 +43,45 @@ def ensure_module_installed(module_name, arch_package=None):
                 return __import__(module_name)
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
+        return None
 
 # Install dependencies
-CORS = ensure_module_installed("flask_cors", "python-flask-cors").CORS
+flask_cors_module = ensure_module_installed("flask_cors", "python-flask-cors")
+CORS = flask_cors_module.CORS if flask_cors_module else None
 psutil = ensure_module_installed("psutil", "python-psutil")
 requests = ensure_module_installed("requests", "python-requests")
 flask = ensure_module_installed("flask", "python-flask")
 websockets = ensure_module_installed("websockets", "python-websockets")
 bluetooth = ensure_module_installed("bleak", "python-bleak")
-pyudev = ensure_module_installed("pyudev", "python-pyudev")
+pyudev_module = ensure_module_installed("pyudev", "python-pyudev")
 
 # Add helper function for parent device traversal
-from pyudev import Context
-
-context = Context()
+if pyudev_module:
+    from pyudev import Context
+    context = Context()
+else:
+    context = None
 
 def get_parent_device(device):
     try:
-        parent = device.parent
-        return parent
+        if pyudev_module and not device is None:
+            parent = device.parent
+            return parent
     except Exception:
-        return None
+        pass
+    return None
 
 # Optional modules
-PULSEAUDIO_AVAILABLE = bool(ensure_module_installed("pulsectl", "python-pulsectl"))
+try:
+    pulsectl_module = ensure_module_installed("pulsectl", "python-pulsectl")
+    if pulsectl_module:
+        # Test if pulsectl can actually be imported and used
+        import pulsectl
+        PULSEAUDIO_AVAILABLE = True
+    else:
+        PULSEAUDIO_AVAILABLE = False
+except Exception:
+    PULSEAUDIO_AVAILABLE = False
 try:
     import gi
     gi.require_version('NM', '1.0')
@@ -79,7 +94,8 @@ from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 sys.modules["flask.cli"].show_server_banner = lambda *x: None
-CORS(app, resources={r"/*": {"origins": "*"}})
+if CORS:
+    CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Configuration
 METRICS_INTERVAL, BLUETOOTH_INTERVAL, USB_SCAN_INTERVAL, USB_MONITOR_INTERVAL, HEARTBEAT_INTERVAL = 1.0, 5.0, 10.0, 2.0, 10
@@ -135,7 +151,8 @@ def get_system_metrics():
     }
 
 def get_system_info():
-    bluetooth_available = "Controller" in run_command(["bluetoothctl", "show"]).get("stdout", "")
+    bluetooth_result = run_command(["bluetoothctl", "show"])
+    bluetooth_available = bluetooth_result.get("success", False) and "Controller" in bluetooth_result.get("stdout", "")
     return {
         "platform": {"system": "Arch Linux", "architecture": platform.machine()},
         "cpu": {"cores": psutil.cpu_count(logical=False), "threads": psutil.cpu_count(logical=True)},
@@ -147,17 +164,17 @@ def get_system_info():
 def get_wifi_info_sync():
     if not NETWORKMANAGER_AVAILABLE:
         return {"error": "NetworkManager not available", "connected": False, "scan": []}
-    
+
     try:
         client = NM.Client.new(None)
         wifi_info = {"connected": False, "ssid": "Unknown", "signal_strength": 0, "scan": []}
-        
+
         # Get connected network info
         for conn in client.get_active_connections():
             if conn.get_connection_type() == '802-11-wireless':
                 settings = conn.get_connection()
                 wifi_settings = settings.get_setting_wireless()
-                
+
                 # Get signal strength
                 signal_strength = 0
                 for device in client.get_devices():
@@ -173,7 +190,7 @@ def get_wifi_info_sync():
                     "signal_strength": signal_strength
                 })
                 break
-        
+
         # Get nearby networks
         nearby_networks = []
         for device in client.get_devices():
@@ -181,24 +198,24 @@ def get_wifi_info_sync():
                 try:
                     # Request fresh scan
                     device.request_scan_async(None, None, None)
-                    
+
                     # Get access points
                     access_points = device.get_access_points()
                     seen_ssids = set()
-                    
+
                     for ap in access_points:
                         ssid_bytes = ap.get_ssid()
                         if not ssid_bytes:
                             continue
-                            
+
                         try:
                             ssid = ssid_bytes.get_data().decode('utf-8')
                         except UnicodeDecodeError:
                             continue
-                            
+
                         if ssid and ssid not in seen_ssids:
                             seen_ssids.add(ssid)
-                            
+
                             network_info = {
                                 "ssid": ssid,
                                 "signal_strength": ap.get_strength(),
@@ -206,19 +223,19 @@ def get_wifi_info_sync():
                                 "connected": ssid == wifi_info.get("ssid", "")
                             }
                             nearby_networks.append(network_info)
-                            
+
                 except Exception as e:
-                    if "--debug" in sys.argv: 
+                    if "--debug" in sys.argv:
                         print(f"[roturLink] WiFi scan error: {e}")
                     continue
                 break
-        
+
         # Sort by signal strength
         nearby_networks.sort(key=lambda x: x["signal_strength"], reverse=True)
         wifi_info["scan"] = nearby_networks[:20]  # Limit to top 20
-        
+
         return wifi_info
-        
+
     except Exception as e:
         return {"error": str(e), "connected": False, "scan": []}
 
@@ -228,14 +245,14 @@ async def get_wifi_info():
 def get_brightness_sync():
     result = run_command(["brightnessctl", "get"])
     max_result = run_command(["brightnessctl", "max"])
-    
+
     if result["success"] and max_result["success"]:
         try:
             current, maximum = int(result["stdout"]), int(max_result["stdout"])
             return {"brightness": int((current / maximum) * 100), "current": current, "max": maximum, "available": True}
         except ValueError:
             pass
-    
+
     percent_result = run_command(["brightnessctl", "-m"])
     if percent_result["success"]:
         try:
@@ -243,7 +260,7 @@ def get_brightness_sync():
             return {"brightness": percentage, "available": True}
         except (IndexError, ValueError):
             pass
-    
+
     return {"brightness": 0, "available": False, "error": "brightnessctl not available"}
 
 async def get_brightness():
@@ -265,7 +282,7 @@ def get_volume_sync():
                     return {"volume": int(sink.volume.value_flat * 100), "muted": sink.mute == 1, "available": True}
         except Exception as e:
             if "--debug" in sys.argv: print(f"[roturLink] PulseAudio error: {e}")
-    
+
     # Fallback to amixer
     result = run_command(["amixer", "get", "Master"])
     if result["success"]:
@@ -273,7 +290,7 @@ def get_volume_sync():
         match = re.search(r'\[(\d+)%\]', result["stdout"])
         if match:
             return {"volume": int(match.group(1)), "muted": "[off]" in result["stdout"], "available": True}
-    
+
     return {"volume": 0, "muted": True, "available": False, "error": "No audio control available"}
 
 async def get_volume():
@@ -291,7 +308,7 @@ def set_volume_sync(percentage):
                     return {"success": True, "volume": percentage}
         except Exception:
             pass
-    
+
     result = run_command(["amixer", "set", "Master", f"{percentage}%"])
     return {"success": result["success"], "volume": percentage} if result["success"] else {"success": False, "error": "Volume set failed"}
 
@@ -310,7 +327,7 @@ def toggle_mute_sync():
                     return {"success": True, "muted": not sink.mute}
         except Exception:
             pass
-    
+
     result = run_command(["amixer", "set", "Master", "toggle"])
     if result["success"]:
         volume_info = get_volume_sync()
@@ -328,21 +345,22 @@ def mount_usb_drive(device_path):
             mount_point = output.split("at")[-1].strip()
             return {"success": True, "mount_point": mount_point, "message": f"Mounted at {mount_point}"}
         return {"success": True, "message": "Drive mounted successfully"}
-    
+
     # Fallback to manual mount
     if "not found" in result.get("error", ""):
         mount_point = f"/mnt/usb_{os.path.basename(device_path)}"
         os.makedirs(mount_point, exist_ok=True)
         manual_result = run_command(["sudo", "mount", device_path, mount_point], timeout=30)
         return {"success": manual_result["success"], "mount_point": mount_point, "message": f"Mounted at {mount_point}"} if manual_result["success"] else {"success": False, "error": "Manual mount failed"}
-    
+
     return {"success": False, "error": result.get("error", "Mount failed")}
 
 def get_unmounted_usb_devices():
     try:
-        context = pyudev.Context()
+        if not context:
+            return []
         unmounted_devices = []
-        
+
         # Get mounted devices
         mounted_devices = set()
         try:
@@ -350,17 +368,17 @@ def get_unmounted_usb_devices():
                 mounted_devices = {line.split()[0] for line in f if line.split()[0].startswith('/dev/')}
         except Exception:
             pass
-        
+
         # Find USB devices
         for device in context.list_devices(subsystem='block'):
             device_node = device.device_node
             if not device_node or device_node in mounted_devices:
                 continue
-                
+
             # Check if USB
             device_path = device.device_path
             is_usb = '/usb' in device_path or 'usb' in device.properties.get('ID_BUS', '').lower()
-            
+
             if not is_usb:
                 # Check parent chain
                 current = device
@@ -371,7 +389,7 @@ def get_unmounted_usb_devices():
                     if current.subsystem == 'usb':
                         is_usb = True
                         break
-            
+
             if is_usb and device.properties.get('ID_FS_TYPE'):
                 device_info = {
                     "device_node": device_node,
@@ -379,7 +397,7 @@ def get_unmounted_usb_devices():
                     "filesystem": device.properties.get('ID_FS_TYPE', 'unknown'),
                     "size_gb": 0
                 }
-                
+
                 # Get size
                 try:
                     size_path = f"/sys/block/{device.sys_name.rstrip('0123456789')}/size"
@@ -389,9 +407,9 @@ def get_unmounted_usb_devices():
                             device_info["size_gb"] = round(sectors * 512 / (1024**3), 2)
                 except Exception:
                     pass
-                
+
                 unmounted_devices.append(device_info)
-        
+
         return unmounted_devices
     except Exception as e:
         if "--debug" in sys.argv: print(f"[roturLink] USB devices error: {e}")
@@ -400,45 +418,48 @@ def get_unmounted_usb_devices():
 def auto_mount_usb_drives():
     unmounted = get_unmounted_usb_devices()
     mounted_results = []
-    
+
     for device in unmounted:
         if "--debug" in sys.argv: print(f"[roturLink] Auto-mounting: {device['name']}")
         result = mount_usb_drive(device['device_node'])
         mounted_results.append({"device": device, "mount_result": result})
-        
+
         if "--debug" in sys.argv:
             status = "Success" if result.get("success") else "Failed"
             print(f"[roturLink] {status}: {result.get('message', result.get('error', ''))}")
-    
+
     return mounted_results
 
 def safely_remove_usb(device_path):
     result = run_command(["udisksctl", "unmount", "-b", device_path], timeout=30)
     if result["success"]:
         return {"success": True, "message": f"Safely removed {device_path}"}
-    
+
     # Fallback
     if "not found" in result.get("error", ""):
         manual_result = run_command(["sudo", "umount", device_path], timeout=30)
         return {"success": manual_result["success"], "message": f"Safely removed {device_path}"} if manual_result["success"] else {"success": False, "error": "Manual unmount failed"}
-    
+
     return {"success": False, "error": result.get("error", "Unmount failed")}
 
 def get_usb_drives(force_scan=False):
     current_time = time.time()
     if not force_scan and (current_time - system_metrics_cache.get("last_usb_scan", 0)) < USB_SCAN_INTERVAL:
         return system_metrics_cache.get("drives", [])
-    
+
     auto_mount_usb_drives()
-    
+
     try:
-        context = pyudev.Context()
+        if not context:
+            system_metrics_cache["drives"] = []
+            system_metrics_cache["last_usb_scan"] = current_time
+            return []
         usb_drives = []
-        
+
         for device in context.list_devices(subsystem='block', DEVTYPE='disk'):
             device_path = device.device_path
             is_usb = '/usb' in device_path or 'usb' in device.properties.get('ID_BUS', '').lower()
-            
+
             if not is_usb:
                 current = device
                 for _ in range(10):
@@ -448,7 +469,7 @@ def get_usb_drives(force_scan=False):
                     if current.subsystem == 'usb':
                         is_usb = True
                         break
-            
+
             if is_usb:
                 device_info = {
                     "device_node": device.device_node,
@@ -457,7 +478,7 @@ def get_usb_drives(force_scan=False):
                     "files": [],
                     "mount_points": []
                 }
-                
+
                 # Get size
                 try:
                     size_path = f"/sys/block/{device.sys_name}/size"
@@ -467,7 +488,7 @@ def get_usb_drives(force_scan=False):
                             device_info["size_gb"] = round(sectors * 512 / (1024**3), 2)
                 except Exception:
                     pass
-                
+
                 # Get mount points
                 mount_points = []
                 try:
@@ -485,21 +506,21 @@ def get_usb_drives(force_scan=False):
                                 })
                 except Exception:
                     pass
-                
+
                 device_info["mount_points"] = mount_points
-                
+
                 if mount_points:
                     label = device.properties.get('ID_FS_LABEL', '')
                     device_info["name"] = label or mount_points[0]["mount_name"]
-                    
+
                     if len(usb_drives) < 3:  # Limit file operations
                         try:
                             device_info["files"] = list_directory_contents(mount_points[0]["mount_point"])
                         except Exception:
                             device_info["files"] = []
-                    
+
                     usb_drives.append(device_info)
-        
+
         system_metrics_cache["drives"] = usb_drives
         system_metrics_cache["last_usb_scan"] = current_time
         return usb_drives
@@ -510,46 +531,166 @@ def get_usb_drives(force_scan=False):
 async def scan_bluetooth_devices():
     try:
         from bleak import BleakScanner
-        discovered_devices = await BleakScanner.discover(timeout=2.0)
         current_time = time.time()
+        devices_dict = {}
         
-        devices = []
-        for device in discovered_devices:
-            rssi = -90
-            if hasattr(device, 'advertisement_data') and hasattr(device.advertisement_data, 'rssi'):
-                rssi = device.advertisement_data.rssi
+        # First, get connected devices from bluetoothctl
+        connected_devices = await get_connected_bluetooth_devices()
+        
+        # Add connected devices to our dictionary
+        for device in connected_devices:
+            devices_dict[device["address"]] = device
+        
+        # Then discover nearby devices
+        try:
+            discovered_devices = await BleakScanner.discover(timeout=2.0)
             
-            device_info = {
-                "name": device.name or "Unknown",
-                "address": device.address,
-                "rssi": rssi,
-                "last_seen": current_time
-            }
-            devices.append(device_info)
+            for device in discovered_devices:
+                rssi = -90
+                if hasattr(device, 'advertisement_data') and hasattr(device.advertisement_data, 'rssi'):
+                    rssi = device.advertisement_data.rssi
+
+                device_address = device.address
+                device_name = device.name or "Unknown"
+                
+                # If device is already in our dict (connected), update it with scan info
+                if device_address in devices_dict:
+                    devices_dict[device_address].update({
+                        "rssi": rssi,
+                        "last_seen": current_time,
+                        "name": device_name if device_name != "Unknown" else devices_dict[device_address]["name"]
+                    })
+                else:
+                    # New discovered device (not connected)
+                    devices_dict[device_address] = {
+                        "name": device_name,
+                        "address": device_address,
+                        "rssi": rssi,
+                        "connected": False,
+                        "last_seen": current_time
+                    }
+                    
+        except Exception as scan_error:
+            if "--debug" in sys.argv:
+                print(f"[roturLink] Bluetooth scan error: {scan_error}")
+        
+        # Convert to list and update global cache
+        devices = list(devices_dict.values())
         
         BLUETOOTH_DEVICES.clear()
         for device in devices:
             BLUETOOTH_DEVICES[device["address"]] = device
-            
+
         return devices
+        
     except Exception as e:
-        if "--debug" in sys.argv: print(f"[roturLink] Bluetooth error: {e}")
+        error_msg = str(e)
+        if "--debug" in sys.argv:
+            if "org.bluez" in error_msg or "NameHasNoOwner" in error_msg:
+                print(f"[roturLink] Bluetooth error: Bluetooth service (bluez) not available or not running. Error: {e}")
+            elif "Permission" in error_msg:
+                print(f"[roturLink] Bluetooth error: Permission denied. Try running with appropriate permissions. Error: {e}")
+            else:
+                print(f"[roturLink] Bluetooth error: {e}")
         return list(BLUETOOTH_DEVICES.values())
 
+async def get_connected_bluetooth_devices():
+    """Get currently connected Bluetooth devices using bluetoothctl"""
+    try:
+        # Run bluetoothctl info command to get connected devices
+        result = await run_async(run_command, ["bluetoothctl", "devices", "Connected"])
+        
+        connected_devices = []
+        current_time = time.time()
+        
+        if result["success"] and result["stdout"]:
+            lines = result["stdout"].strip().split('\n')
+            for line in lines:
+                if line.startswith("Device "):
+                    parts = line.split(' ', 2)
+                    if len(parts) >= 3:
+                        address = parts[1]
+                        name = parts[2] if len(parts) > 2 else "Unknown"
+                        
+                        # Get additional device info
+                        device_info = await get_bluetooth_device_info(address)
+                        
+                        connected_device = {
+                            "name": name,
+                            "address": address,
+                            "connected": True,
+                            "rssi": device_info.get("rssi", -90),  # Default RSSI for connected devices
+                            "last_seen": current_time,
+                            "device_type": device_info.get("device_type", "Unknown"),
+                            "services": device_info.get("services", [])
+                        }
+                        connected_devices.append(connected_device)
+        
+        return connected_devices
+        
+    except Exception as e:
+        if "--debug" in sys.argv:
+            print(f"[roturLink] Error getting connected devices: {e}")
+        return []
+
+async def get_bluetooth_device_info(address):
+    """Get detailed info for a specific Bluetooth device"""
+    try:
+        result = await run_async(run_command, ["bluetoothctl", "info", address])
+        
+        device_info = {
+            "rssi": -90,
+            "device_type": "Unknown",
+            "services": []
+        }
+        
+        if result["success"] and result["stdout"]:
+            lines = result["stdout"].split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.startswith("RSSI:"):
+                    try:
+                        rssi_value = line.split(':')[1].strip()
+                        device_info["rssi"] = int(rssi_value)
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("Icon:"):
+                    try:
+                        icon = line.split(':')[1].strip()
+                        device_info["device_type"] = icon
+                    except IndexError:
+                        pass
+                elif line.startswith("UUID:"):
+                    try:
+                        service_line = line.split(':', 1)[1].strip()
+                        # Extract service name from UUID line (usually in parentheses)
+                        if '(' in service_line and ')' in service_line:
+                            service_name = service_line.split('(')[1].split(')')[0]
+                            device_info["services"].append(service_name)
+                    except (IndexError, ValueError):
+                        pass
+        
+        return device_info
+        
+    except Exception as e:
+        if "--debug" in sys.argv:
+            print(f"[roturLink] Error getting device info for {address}: {e}")
+        return {"rssi": -90, "device_type": "Unknown", "services": []}
+        
 def list_directory_contents(path):
     try:
         if not os.path.exists(path) or not os.path.isdir(path):
             return []
-        
+
         items = []
         entries = sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
-        
+
         for entry in entries:
             try:
                 full_path = os.path.join(path, entry)
                 if not os.path.exists(full_path):
                     continue
-                
+
                 is_dir = os.path.isdir(full_path)
                 item = {
                     "name": entry,
@@ -558,12 +699,12 @@ def list_directory_contents(path):
                     "writable": os.access(full_path, os.W_OK),
                     "path": full_path,
                 }
-                
+
                 try:
                     stat_info = os.stat(full_path)
                     item["modified"] = int(stat_info.st_mtime)
                     item["permissions"] = oct(stat_info.st_mode)[-3:]
-                    
+
                     if is_dir:
                         try:
                             item["size"] = len(os.listdir(full_path))
@@ -576,11 +717,11 @@ def list_directory_contents(path):
                     item.update({"size": 0, "modified": 0, "permissions": "000"})
                     if not is_dir:
                         item["extension"] = ""
-                
+
                 items.append(item)
             except (OSError, PermissionError):
                 continue
-        
+
         return items
     except Exception as e:
         return {"error": str(e)}
@@ -589,11 +730,11 @@ def read_file_content(file_path, max_size=1024*1024):
     try:
         if not os.path.exists(file_path) or not os.path.isfile(file_path) or not os.access(file_path, os.R_OK):
             return {"error": "File not accessible"}
-        
+
         file_size = os.path.getsize(file_path)
         if file_size > max_size:
             return {"error": f"File too large (max {max_size//1024}KB)"}
-        
+
         # Check if text file
         try:
             with open(file_path, 'rb') as f:
@@ -601,7 +742,7 @@ def read_file_content(file_path, max_size=1024*1024):
                 is_text = not bool(sample.translate(None, bytes(range(32, 127)) + b'\n\r\t\f\b'))
         except:
             is_text = False
-        
+
         if is_text:
             for encoding in ['utf-8', 'latin-1']:
                 try:
@@ -609,13 +750,13 @@ def read_file_content(file_path, max_size=1024*1024):
                         return {"content": f.read(), "type": "text", "size": file_size, "encoding": encoding}
                 except UnicodeDecodeError:
                     continue
-        
+
         # Binary file
         import base64
         with open(file_path, 'rb') as f:
             content = f.read()
         return {"content": base64.b64encode(content).decode('utf-8'), "type": "binary", "size": file_size, "encoding": "base64"}
-            
+
     except Exception as e:
         return {"error": str(e)}
 
@@ -624,7 +765,7 @@ def write_file_content(file_path, content, content_type="text", encoding="utf-8"
         directory = os.path.dirname(file_path)
         if directory and not os.path.exists(directory):
             return {"error": "Directory does not exist"}
-        
+
         if content_type == "text":
             with open(file_path, 'w', encoding=encoding) as f:
                 f.write(content)
@@ -635,7 +776,7 @@ def write_file_content(file_path, content, content_type="text", encoding="utf-8"
                 f.write(binary_content)
         else:
             return {"error": "Invalid content type"}
-        
+
         return {"success": True, "message": f"File written: {file_path}"}
     except Exception as e:
         return {"error": str(e)}
@@ -653,7 +794,7 @@ def delete_file_or_directory(path):
     try:
         if not os.path.exists(path):
             return {"error": "Path does not exist"}
-        
+
         if os.path.isfile(path):
             os.remove(path)
             return {"success": True, "message": f"File deleted: {path}"}
@@ -689,49 +830,49 @@ async def update_and_broadcast_metrics():
             system_metrics_cache["disk"] = {"total": disk.total, "used": disk.used, "percent": disk.percent}
             network = psutil.net_io_counters()
             system_metrics_cache["network"] = {"sent": network.bytes_sent, "received": network.bytes_recv}
-            
+
             if hasattr(psutil, "sensors_battery") and psutil.sensors_battery():
                 battery = psutil.sensors_battery()
                 system_metrics_cache["battery"] = {"percent": round(battery.percent, 1), "plugged": battery.power_plugged}
-            
+
             # Slower operations with rate limiting
             current_time = time.time()
             tasks = []
-            
+
             if current_time - system_metrics_cache.get("last_wifi_update", 0) > 10.0:
                 tasks.append(get_wifi_info())
-                
+
             if current_time - system_metrics_cache.get("last_controls_update", 0) > 5.0:
                 tasks.extend([get_brightness(), get_volume()])
-            
+
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                
+
                 result_index = 0
                 if current_time - system_metrics_cache.get("last_wifi_update", 0) > 10.0:
                     if not isinstance(results[result_index], Exception):
                         system_metrics_cache["wifi"] = results[result_index]
                         system_metrics_cache["last_wifi_update"] = current_time
                     result_index += 1
-                    
+
                 if current_time - system_metrics_cache.get("last_controls_update", 0) > 5.0:
                     if result_index < len(results) and not isinstance(results[result_index], Exception):
                         brightness_info = results[result_index]
                         system_metrics_cache["brightness"] = brightness_info.get("brightness", 0)
                     result_index += 1
-                    
+
                     if result_index < len(results) and not isinstance(results[result_index], Exception):
                         volume_info = results[result_index]
                         system_metrics_cache["volume"] = {"level": volume_info.get("volume", 0), "muted": volume_info.get("muted", False)}
-                    
+
                     system_metrics_cache["last_controls_update"] = current_time
-            
+
             if connected_clients:
                 asyncio.create_task(broadcast_to_all_clients({"cmd": "metrics_update", "val": get_system_metrics()}))
-                
+
         except Exception as e:
             if "--debug" in sys.argv: print(f"[roturLink] Metrics error: {e}")
-        
+
         await asyncio.sleep(METRICS_INTERVAL)
 
 async def update_and_broadcast_bluetooth():
@@ -740,13 +881,13 @@ async def update_and_broadcast_bluetooth():
             devices = await scan_bluetooth_devices()
             system_metrics_cache["bluetooth"] = devices
             await broadcast_to_all_clients({"cmd": "bluetooth_update", "val": {"bluetooth": {"devices": devices, "count": len(devices), "timestamp": time.time()}}})
-            
+
             current_time = time.time()
             if current_time - system_metrics_cache.get("last_usb_broadcast", 0) > USB_SCAN_INTERVAL * 2:
                 drives = get_usb_drives()
                 await broadcast_to_all_clients({"cmd": "drives_update", "val": {"drives": drives, "change_type": "periodic"}})
                 system_metrics_cache["last_usb_broadcast"] = current_time
-                
+
         await asyncio.sleep(BLUETOOTH_INTERVAL)
 
 def get_drive_identifiers(drives):
@@ -754,47 +895,47 @@ def get_drive_identifiers(drives):
 
 async def monitor_usb_drives():
     previous_drives = set()
-    
+
     while True:
         try:
             current_drives = get_usb_drives(force_scan=True)
             current_identifiers = get_drive_identifiers(current_drives)
-            
+
             if previous_drives and current_identifiers != previous_drives:
                 removed_drives = previous_drives - current_identifiers
                 added_drives = current_identifiers - previous_drives
-                
+
                 if removed_drives or added_drives:
                     if "--debug" in sys.argv:
                         if removed_drives: print(f"[roturLink] USB drives removed: {removed_drives}")
                         if added_drives: print(f"[roturLink] USB drives added: {added_drives}")
-                    
+
                     updated_drives = get_usb_drives(force_scan=True)
                     if connected_clients:
                         await broadcast_to_all_clients({"cmd": "drives_update", "val": {"drives": updated_drives, "change_type": "removal" if removed_drives else "addition"}})
-            
+
             previous_drives = current_identifiers
             system_metrics_cache["last_drive_check"] = time.time()
-            
+
         except Exception as e:
             if "--debug" in sys.argv: print(f"[roturLink] USB monitor error: {e}")
-        
+
         await asyncio.sleep(USB_MONITOR_INTERVAL)
 
 async def handle_command(websocket, message):
     try:
         if isinstance(message, str):
             message = json.loads(message)
-        
+
         cmd = message.get("cmd")
-        
+
         # Command handlers with immediate responses
         command_handlers = {
             "ping": lambda: {"cmd": "pong", "val": {"timestamp": time.time()}},
             "get_metrics": lambda: {"cmd": "metrics", "val": get_system_metrics()},
             "get_system_info": lambda: {"cmd": "system_info", "val": get_system_info()},
         }
-        
+
         if cmd in command_handlers:
             await send_to_client(websocket, command_handlers[cmd]())
         elif cmd == "brightness_get":
@@ -819,7 +960,7 @@ async def handle_command(websocket, message):
             await send_to_client(websocket, {"cmd": "volume_response", "val": result})
         else:
             await send_to_client(websocket, {"cmd": "error", "val": {"message": f"Unknown command: {cmd}"}})
-    
+
     except json.JSONDecodeError:
         await send_to_client(websocket, {"cmd": "error", "val": {"message": "Invalid JSON"}})
     except Exception as e:
@@ -828,17 +969,17 @@ async def handle_command(websocket, message):
 async def handler(websocket):
     origin = websocket.request.headers.get("origin", "")
     client_ip = websocket.remote_address[0] if hasattr(websocket, 'remote_address') else "unknown"
-    
+
     if not (client_ip in ("127.0.0.1", "::1") or is_origin_allowed(origin)):
         return
-    
+
     connected_clients.add(websocket)
-    
+
     try:
         await send_to_client(websocket, {"cmd": "handshake", "val": {"server": "rotur-websocket", "version": "1.0.0"}})
         await send_to_client(websocket, {"cmd": "system_info", "val": get_system_info()})
         await send_to_client(websocket, {"cmd": "metrics", "val": get_system_metrics()})
-        
+
         async for message in websocket:
             asyncio.create_task(handle_command(websocket, message))
     except:
@@ -851,7 +992,7 @@ async def start_websocket_server():
     asyncio.create_task(update_and_broadcast_metrics())
     asyncio.create_task(update_and_broadcast_bluetooth())
     asyncio.create_task(monitor_usb_drives())
-    
+
     async with websockets.serve(handler, "127.0.0.1", 5002, ping_interval=None):
         if "--debug" in sys.argv: print("[roturLink] WebSocket server at ws://127.0.0.1:5002")
         await asyncio.Future()
@@ -889,21 +1030,21 @@ def proxy():
         response = app.response_class("", 200)
         response.headers.update({'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS', 'Access-Control-Max-Age': '86400'})
         return response
-        
+
     url = request.args.get('url')
-    if not url: 
+    if not url:
         return jsonify({"error": "URL parameter missing"}), 400
-    
+
     try:
         headers = {k: v for k, v in request.headers if k.lower() not in ['host', 'content-length', 'connection']}
         response = requests.request(method=request.method, url=url, headers=headers, params=request.args, data=request.get_data(), timeout=10, allow_redirects=True)
-        
+
         proxy_response = Response(response.content)
         if 'Content-Type' in response.headers:
             proxy_response.headers['Content-Type'] = response.headers['Content-Type']
         proxy_response.headers.update({'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS', 'Access-Control-Allow-Headers': '*'})
         return proxy_response, response.status_code
-        
+
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e)}), 500
 
