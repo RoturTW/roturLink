@@ -129,4 +129,4 @@ ws.send(JSON.stringify({cmd: 'volume_set', val: 50}));
 
 ## License
 
-[Add your license information here]
+MIT
